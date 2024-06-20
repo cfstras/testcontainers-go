@@ -8,6 +8,8 @@ import (
 	"net"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/testcontainers/testcontainers-go"
 )
@@ -26,6 +28,9 @@ type Container struct {
 	user         string
 	password     string
 	snapshotName string
+
+	restoreConnection     *sql.DB
+	restoreConnectionOnce sync.Once
 }
 
 // MustConnectionString panics if the address cannot be determined.
@@ -163,6 +168,27 @@ func RunContainer(ctx context.Context, opts ...testcontainers.RequestCustomizer)
 	return &Container{DockerContainer: ctr, dbName: dbName, password: password, user: user}, nil
 }
 
+// Stop overrides testcontainers.Container.Stop() to close the database connection before stopping the container
+func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
+	c.closeRestoreConnection()
+	return c.DockerContainer.Stop(ctx, timeout)
+}
+
+// Terminate overrides testcontainers.Container.Terminate() to close the database connection before terminate the container
+func (c *Container) Terminate(ctx context.Context) error {
+	c.closeRestoreConnection()
+	return c.DockerContainer.Terminate(ctx)
+}
+
+func (c *Container) closeRestoreConnection() {
+	if c.restoreConnection != nil {
+		if err := c.restoreConnection.Close(); err != nil {
+			c.Printf("Could not close database connection before stopping container: %v", err)
+		}
+		c.restoreConnection = nil
+	}
+}
+
 type snapshotConfig struct {
 	snapshotName string
 }
@@ -240,12 +266,16 @@ func (c *Container) checkSnapshotConfig(opts []SnapshotOption) (string, error) {
 }
 
 func (c *Container) execCommandsSQL(ctx context.Context, cmds ...string) error {
-	conn, cleanup, err := c.snapshotConnection(ctx)
+	conn, err := c.snapshotConnection(ctx)
 	if err != nil {
 		c.Printf("Could not connect to database to restore snapshot, falling back to `docker exec psql`: %v", err)
 		return c.execCommandsFallback(ctx, cmds)
 	}
-	defer cleanup()
+	defer func() {
+		if err := conn.Close(); err != nil {
+			c.Printf("Could not close database connection after restore snapshot: %v", err)
+		}
+	}()
 	for _, cmd := range cmds {
 		if _, err := conn.ExecContext(ctx, cmd); err != nil {
 			return fmt.Errorf("could not execute restore command %s: %w", cmd, err)
@@ -258,34 +288,36 @@ func (c *Container) execCommandsSQL(ctx context.Context, cmds ...string) error {
 // The returned function should be called as a defer() to close the pool.
 // No need to close the individual connection, that is done as part of the pool close.
 // Also, no need to cache the connection pool, since it is a single connection which is very fast to establish.
-func (c *Container) snapshotConnection(ctx context.Context) (*sql.Conn, func(), error) {
-	// Connect to the database "postgres" instead of the app one
-	c2 := &Container{
-		DockerContainer: c.DockerContainer,
-		dbName:          "postgres",
-		user:            c.user,
-		password:        c.password,
-	}
-
-	// Try to use an actual postgres connection, if the driver is loaded
-	connStr := c2.MustConnectionString(ctx, "sslmode=disable")
-	pool, err := sql.Open("postgres", connStr)
-	if err != nil {
-		return nil, nil, fmt.Errorf("sql.Open for snapshot connection failed: %w", err)
-	}
-
-	cleanupPool := func() {
-		if err := pool.Close(); err != nil {
-			c.Printf("Could not close database connection pool after restoring snapshot: %v", err)
+func (c *Container) snapshotConnection(ctx context.Context) (*sql.Conn, error) {
+	var err error
+	c.restoreConnectionOnce.Do(func() {
+		// Connect to the database "postgres" instead of the app one
+		c2 := &Container{
+			DockerContainer: c.DockerContainer,
+			dbName:          "postgres",
+			user:            c.user,
+			password:        c.password,
 		}
+
+		// Try to use an actual postgres connection, if the driver is loaded
+		connStr := c2.MustConnectionString(ctx, "sslmode=disable")
+		var pool *sql.DB
+		pool, err = sql.Open("postgres", connStr)
+		if err == nil {
+			c.restoreConnection = pool
+		}
+	})
+	if err != nil {
+		// Reset the sync.Once so we can try again next time
+		c.restoreConnectionOnce = sync.Once{}
+		return nil, fmt.Errorf("sql.Open for snapshot connection failed: %w", err)
 	}
 
-	conn, err := pool.Conn(ctx)
+	conn, err := c.restoreConnection.Conn(ctx)
 	if err != nil {
-		cleanupPool()
-		return nil, nil, fmt.Errorf("DB.Conn for snapshot connection failed: %w", err)
+		return nil, fmt.Errorf("DB.Conn for snapshot connection failed: %w", err)
 	}
-	return conn, cleanupPool, nil
+	return conn, nil
 }
 
 func (c *Container) execCommandsFallback(ctx context.Context, cmds []string) error {
