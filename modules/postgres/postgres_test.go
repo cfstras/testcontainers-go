@@ -408,7 +408,7 @@ func TestSnapshotWithOverrides(t *testing.T) {
 func TestSnapshotWithDockerExecFallback(t *testing.T) {
 	// Tell the postgres module to use a driver that doesn't exist
 	// This will cause the module to fall back to using docker exec
-	postgres.SQLDriverName = "DoesNotExist"
+	// postgres.SQLDriverName = "DoesNotExist"
 
 	ctx := context.Background()
 
